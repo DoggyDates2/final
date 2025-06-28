@@ -518,6 +518,112 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
                         file_name="reassignment_results.csv",
                         mime="text/csv"
                     )
+                    
+                    # NEW: Copy-paste format for Google Sheets
+                    st.subheader("📋 Copy-Paste New Assignments")
+                    st.markdown("*Copy the text below and paste into your Google Sheet to update assignments*")
+                    
+                    # Option selector
+                    paste_option = st.radio(
+                        "What do you want to copy?",
+                        ["Just reassigned dogs", "All dogs (complete updated list)"],
+                        help="Choose whether to copy just the dogs that were reassigned, or all dogs with their updated assignments"
+                    )
+                    
+                    if paste_option == "Just reassigned dogs":
+                        # Create the updated assignments for reassigned dogs only
+                        paste_text_lines = ["Dog ID\tNew Assignment"]
+                        for r in reassignments:
+                            new_assignment = f"{r['To Driver']}:{r['Groups']}"
+                            paste_text_lines.append(f"{r['Dog ID']}\t{new_assignment}")
+                        
+                        paste_text = "\n".join(paste_text_lines)
+                        
+                        st.text_area(
+                            f"📋 Copy this text for {len(reassignments)} reassigned dogs (Ctrl+A, Ctrl+C):",
+                            value=paste_text,
+                            height=200,
+                            help="Select all text and copy, then paste into your Google Sheet"
+                        )
+                        
+                    else:  # All dogs
+                        # Get all current assignments and update with reassignments
+                        all_assignments = {}
+                        for dog_id, info in system.dogs_going_today.items():
+                            all_assignments[dog_id] = info['assignment']
+                        
+                        # Update with reassignments
+                        for r in reassignments:
+                            dog_id = r['Dog ID']
+                            new_assignment = f"{r['To Driver']}:{r['Groups']}"
+                            all_assignments[dog_id] = new_assignment
+                        
+                        # Format for pasting - all dogs
+                        paste_text_lines = ["Dog ID\tToday Assignment"]
+                        for dog_id, assignment in sorted(all_assignments.items()):
+                            paste_text_lines.append(f"{dog_id}\t{assignment}")
+                        
+                        paste_text = "\n".join(paste_text_lines)
+                        
+                        st.text_area(
+                            f"📋 Copy this text for ALL {len(all_assignments)} dogs (Ctrl+A, Ctrl+C):",
+                            value=paste_text,
+                            height=300,
+                            help="Complete updated list - select all text and copy, then paste into your Google Sheet"
+                        )
+                    
+                    # Instructions
+                    st.info("💡 **How to paste in Google Sheets:**\n1. Copy the text above (Ctrl+A, then Ctrl+C)\n2. In Google Sheets, click on cell A1 (or wherever you want to start)\n3. Paste (Ctrl+V)\n4. The data will automatically split into columns")
+                    
+                    # Alternative: Simple assignment list
+                    st.subheader("📝 Simple Assignment List (No Headers)")
+                    st.markdown("*If you just want the assignments in a simple list:*")
+                    
+                    if paste_option == "Just reassigned dogs":
+                        simple_assignments = []
+                        for r in reassignments:
+                            simple_assignments.append(f"{r['To Driver']}:{r['Groups']}")
+                        simple_text = "\n".join(simple_assignments)
+                        
+                        st.text_area(
+                            f"Simple list ({len(reassignments)} assignments):",
+                            value=simple_text,
+                            height=120,
+                            help="Just the new assignments, one per line"
+                        )
+                        
+                        # Show which dogs these correspond to
+                        with st.expander("🔍 See which dogs these assignments are for"):
+                            assignment_mapping = []
+                            for i, r in enumerate(reassignments):
+                                assignment_mapping.append({
+                                    'Line #': i + 1,
+                                    'Dog ID': r['Dog ID'],
+                                    'Dog Name': r['Dog Name'], 
+                                    'Assignment': f"{r['To Driver']}:{r['Groups']}"
+                                })
+                            st.dataframe(pd.DataFrame(assignment_mapping), use_container_width=True)
+                    
+                    else:  # All dogs simple list
+                        all_assignments = {}
+                        for dog_id, info in system.dogs_going_today.items():
+                            all_assignments[dog_id] = info['assignment']
+                        
+                        # Update with reassignments
+                        for r in reassignments:
+                            dog_id = r['Dog ID']
+                            new_assignment = f"{r['To Driver']}:{r['Groups']}"
+                            all_assignments[dog_id] = new_assignment
+                        
+                        simple_assignments = [assignment for assignment in sorted(all_assignments.values())]
+                        simple_text = "\n".join(simple_assignments)
+                        
+                        st.text_area(
+                            f"All assignments ({len(simple_assignments)} total):",
+                            value=simple_text,
+                            height=200,
+                            help="All assignments in order, one per line"
+                        )
                 else:
                     st.info("No successful reassignments needed")
             
@@ -637,6 +743,7 @@ with st.expander("📖 How to Use"):
     - ✅ **Driver assignment** and group information
     - ✅ **Updated group counts** after reassignment (e.g., Bri:1 → 10 dogs)
     - ✅ **Capacity status** with warnings for over-capacity groups
+    - ✅ **Copy-paste format** for updating your Google Sheet
     - ✅ **Downloadable CSV** with all details
     
     ### Features:
@@ -655,4 +762,4 @@ with st.expander("📖 How to Use"):
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ for efficient dog logistics • Live Google Sheets integration!")
+st.markdown("Built with ❤️ for efficient dog logistics • Live Google Sheets integration • Copy-paste ready results!")
