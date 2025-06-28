@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 class DogReassignmentSystem:
     """
     Dog Reassignment System - All functions in one file to avoid import issues
+    
+    IMPORTANT DISTANCE MATRIX LOGIC:
+    - Distance = 0 means NOT a viable match (too far apart or separated by barriers)
+    - Distance > 0 means viable match with that distance in miles
+    - We skip/ignore all distance = 0 pairs as impossible matches
     """
     
     def __init__(self):
@@ -50,7 +55,12 @@ class DogReassignmentSystem:
             raise
 
     def load_distance_matrix(self, distance_url: str):
-        """Load and parse the distance matrix from Google Sheets."""
+        """
+        Load and parse the distance matrix from Google Sheets.
+        
+        IMPORTANT: Distance = 0 means NOT a viable match 
+        (dogs are too far apart or separated by barriers)
+        """
         matrix_df = self.load_csv_from_url(distance_url)
         
         # First column contains dog IDs, remaining columns are distances
@@ -64,7 +74,7 @@ class DogReassignmentSystem:
                 try:
                     val = float(row.iloc[j + 1])
                 except (ValueError, TypeError):
-                    val = 0.0  # 0 means not viable match
+                    val = 0.0  # 0 = not viable match (too far apart or barriers)
                 self.distance_matrix[row_id][col_id] = val
 
     def load_combined_data(self, combined_csv_url: str):
@@ -195,12 +205,14 @@ class DogReassignmentSystem:
         return True
 
     def find_candidates_for_dog(self, dog_id: str, dog_groups: List[int], 
-                               max_distance: float = 3.0) -> List[Tuple[str, float]]:
-        """Find candidate drivers for a dog within distance and group constraints."""
+                               max_distance: float = 3.0) -> List[Tuple[str, float, str, str]]:
+        """Find candidate drivers for a dog within distance and group constraints.
+        Returns: List of (driver, distance, matched_dog_id, matched_dog_name)"""
         candidates = []
         distances = self.distance_matrix.get(dog_id, {})
         
         for other_id, dist in distances.items():
+            # Distance = 0 means NOT viable match (too far apart or separated by barriers)
             if dist == 0 or dist > max_distance or other_id not in self.dogs_going_today:
                 continue
                 
@@ -225,7 +237,7 @@ class DogReassignmentSystem:
                     
             # Only consider if all dog's groups can be matched
             if set(matched_groups) == set(dog_groups):
-                candidates.append((other_driver, dist))
+                candidates.append((other_driver, dist, other_id, other_info['dog_name']))
                 
         return candidates
 
@@ -237,6 +249,9 @@ class DogReassignmentSystem:
             other_driver, _ = self.parse_group_assignment(info['assignment'])
             if other_driver == driver:
                 distance = self.distance_matrix.get(dog_id, {}).get(other_id, float('inf'))
+                # Distance = 0 means NOT viable match, treat as impossible distance
+                if distance == 0:
+                    distance = float('inf')
                 min_distance = min(min_distance, distance)
                 
         return min_distance if min_distance != float('inf') else 0
@@ -260,22 +275,20 @@ class DogReassignmentSystem:
             # Filter candidates that can accommodate the dog
             viable_candidates = []
             
-            for driver, dist in candidates:
+            for driver, dist, matched_dog_id, matched_dog_name in candidates:
                 if not self.can_driver_accommodate(driver, dog_groups, num_dogs):
                     continue
                     
                 # Calculate selection criteria
                 current_load = sum(self.driver_loads.get(driver, {}).get(f'group{g}', 0) 
                                  for g in dog_groups)
-                closest_dist = self.get_closest_distance_to_driver(driver, dog_id)
                 
-                viable_candidates.append((driver, current_load, closest_dist))
+                viable_candidates.append((driver, current_load, dist, matched_dog_id, matched_dog_name))
             
             if viable_candidates:
-                # Sort by: 1) fewest dogs currently assigned, 2) closest distance to existing dogs
+                # Sort by: 1) fewest dogs currently assigned, 2) closest distance
                 viable_candidates.sort(key=lambda x: (x[1], x[2]))
-                best_driver = viable_candidates[0][0]
-                best_distance = self.get_closest_distance_to_driver(best_driver, dog_id)
+                best_driver, _, best_distance, best_matched_id, best_matched_name = viable_candidates[0]
                 
                 # Update driver loads
                 for group in dog_groups:
@@ -288,6 +301,8 @@ class DogReassignmentSystem:
                     'Dog Name': dog_name,
                     'From Driver': dog['original_driver'],
                     'To Driver': best_driver,
+                    'Matched With': best_matched_name,
+                    'Matched Dog ID': best_matched_id,
                     'Groups': "&".join(map(str, dog_groups)),
                     'Distance': round(best_distance, 3),
                     'Num Dogs': num_dogs
@@ -315,6 +330,7 @@ class DogReassignmentSystem:
             best_distance = float('inf')
             
             for other_id, dist in distances.items():
+                # Distance = 0 means NOT viable match (too far apart or separated by barriers)
                 if dist == 0 or other_id not in self.dogs_going_today:
                     continue
                     
@@ -456,6 +472,10 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
         st.error("⚠️ Please enter your Combined Sheet URL first")
         st.stop()
     
+    if not distance_url:
+        st.error("⚠️ Please enter your Distance Matrix URL")
+        st.stop()
+    
     try:
         with st.spinner("Loading data and running reassignment..."):
             # Create system and run reassignment
@@ -473,7 +493,12 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
                 st.subheader("✅ Successful Reassignments")
                 if reassignments:
                     df_success = pd.DataFrame(reassignments)
-                    st.dataframe(df_success, use_container_width=True)
+                    
+                    # Reorder columns for better display
+                    display_columns = ['Dog Name', 'From Driver', 'To Driver', 'Matched With', 'Groups', 'Distance', 'Dog ID', 'Matched Dog ID', 'Num Dogs']
+                    df_display = df_success[display_columns]
+                    
+                    st.dataframe(df_display, use_container_width=True)
                     
                     # Summary by driver
                     st.subheader("📈 Summary by Driver")
@@ -532,16 +557,30 @@ with st.expander("📖 How to Use"):
     st.markdown("""
     ### Setup Instructions:
     1. **Paste URLs**: Copy your Google Sheets URLs from your browser and paste them above
-    2. **Sheet Format**: Ensure your CSV has the required columns:
-       - Dog data: `Dog ID`, `Today`, `Number of dogs`, `Dog Name`, `Address`
-       - Driver data: `Driver`, `Group 1`, `Group 2`, `Group 3` (use 'X' for callouts)
+    2. **Sheet Format**: Ensure your data has the required columns:
+       - **Dog data**: `Dog ID`, `Today`, `Number of dogs`, `Dog Name`, `Address`
+       - **Driver data**: `Driver`, `Group 1`, `Group 2`, `Group 3` (use 'X' for callouts)
     3. **Click Run**: Press the "Run Reassignment" button to process
+    
+    ### Distance Matrix Format (Google Sheets):
+    Your distance matrix should have:
+    - **Row 1 & Column A**: Dog IDs
+    - **Cell values**: Distance in miles between dogs
+    - **Value = 0**: Dogs are NOT viable matches (too far apart or separated by barriers)
+    - **Value > 0**: Actual distance in miles (viable match)
+    
+    ### Results Show:
+    - ✅ **Which specific dog** they were matched with
+    - ✅ **Distance** to that matched dog
+    - ✅ **Driver assignment** and group information
+    - ✅ **Downloadable CSV** with all details
     
     ### Features:
     - ✅ Prioritizes closest matches first
     - ✅ Handles multi-group dogs (1&2, 2&3, etc.)
     - ✅ Respects driver capacity limits  
-    - ✅ Exports results to CSV
+    - ✅ Shows matched dog details
+    - ✅ Live data from Google Sheets
     
     ### Callout Format:
     Mark driver callouts by putting **'X'** in the Group columns:
@@ -552,4 +591,4 @@ with st.expander("📖 How to Use"):
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ for efficient dog logistics")
+st.markdown("Built with ❤️ for efficient dog logistics • Live Google Sheets integration!")
