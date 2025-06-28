@@ -6,6 +6,9 @@ import re
 import logging
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Configure page
 st.set_page_config(
@@ -18,9 +21,136 @@ st.set_page_config(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class GoogleSheetsIntegration:
+    """Handle Google Sheets read/write operations with service account."""
+    
+    def __init__(self, service_account_info: dict):
+        """Initialize with service account credentials."""
+        self.service_account_info = service_account_info
+        self.gc = None
+        self._initialize_client()
+    
+    def _initialize_client(self):
+        """Initialize the Google Sheets client."""
+        try:
+            scopes = [
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive'
+            ]
+            
+            credentials = Credentials.from_service_account_info(
+                self.service_account_info, 
+                scopes=scopes
+            )
+            self.gc = gspread.authorize(credentials)
+            logger.info("Google Sheets client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets client: {e}")
+            raise
+    
+    def get_spreadsheet_from_url(self, url: str):
+        """Extract spreadsheet ID from URL and open the spreadsheet."""
+        try:
+            if "/d/" in url:
+                sheet_id = url.split("/d/")[1].split("/")[0]
+            else:
+                raise ValueError("Invalid Google Sheets URL")
+            
+            return self.gc.open_by_key(sheet_id)
+        except Exception as e:
+            logger.error(f"Failed to open spreadsheet from URL {url}: {e}")
+            raise
+    
+    def get_worksheet_from_url(self, url: str):
+        """Get specific worksheet from URL (including gid)."""
+        try:
+            spreadsheet = self.get_spreadsheet_from_url(url)
+            
+            # Extract gid if present
+            if "gid=" in url:
+                gid = url.split("gid=")[1].split("&")[0].split("#")[0]
+                try:
+                    gid = int(gid)
+                    # Find worksheet by gid
+                    for worksheet in spreadsheet.worksheets():
+                        if worksheet.id == gid:
+                            return worksheet
+                    raise ValueError(f"Worksheet with gid {gid} not found")
+                except ValueError:
+                    pass
+            
+            # Default to first worksheet
+            return spreadsheet.sheet1
+        except Exception as e:
+            logger.error(f"Failed to get worksheet from URL {url}: {e}")
+            raise
+    
+    def read_sheet_as_dataframe(self, url: str) -> pd.DataFrame:
+        """Read Google Sheet as pandas DataFrame."""
+        try:
+            worksheet = self.get_worksheet_from_url(url)
+            data = worksheet.get_all_records()
+            return pd.DataFrame(data)
+        except Exception as e:
+            logger.error(f"Failed to read sheet as DataFrame: {e}")
+            raise
+    
+    def update_column_by_dog_id(self, url: str, updates: Dict[str, str], 
+                               dog_id_column: str = "Dog ID", 
+                               target_column: str = "Today"):
+        """Update specific column values by matching Dog ID."""
+        try:
+            worksheet = self.get_worksheet_from_url(url)
+            
+            # Get all data
+            all_data = worksheet.get_all_values()
+            if not all_data:
+                raise ValueError("Worksheet is empty")
+            
+            headers = all_data[0]
+            
+            # Find column indices
+            try:
+                dog_id_col_idx = headers.index(dog_id_column)
+                target_col_idx = headers.index(target_column)
+            except ValueError as e:
+                raise ValueError(f"Column not found: {e}")
+            
+            # Track updates made
+            updates_made = []
+            
+            # Process each row
+            for row_idx, row in enumerate(all_data[1:], start=2):  # Start at row 2 (1-indexed)
+                if row_idx - 1 < len(row):  # Make sure row has enough columns
+                    dog_id = str(row[dog_id_col_idx]).strip() if dog_id_col_idx < len(row) else ""
+                    
+                    if dog_id in updates:
+                        new_value = updates[dog_id]
+                        old_value = row[target_col_idx] if target_col_idx < len(row) else ""
+                        
+                        # Update the cell
+                        cell_address = gspread.utils.rowcol_to_a1(row_idx, target_col_idx + 1)
+                        worksheet.update(cell_address, new_value)
+                        
+                        updates_made.append({
+                            'dog_id': dog_id,
+                            'row': row_idx,
+                            'old_value': old_value,
+                            'new_value': new_value,
+                            'cell': cell_address
+                        })
+                        
+                        logger.info(f"Updated {dog_id}: {old_value} → {new_value} at {cell_address}")
+            
+            return updates_made
+            
+        except Exception as e:
+            logger.error(f"Failed to update sheet: {e}")
+            raise
+
 class DogReassignmentSystem:
     """
-    Dog Reassignment System - All functions in one file to avoid import issues
+    Dog Reassignment System with Google Sheets integration
     
     IMPORTANT DISTANCE MATRIX LOGIC:
     - Distance = 0 means NOT a viable match (too far apart or separated by barriers)
@@ -28,7 +158,8 @@ class DogReassignmentSystem:
     - We skip/ignore all distance = 0 pairs as impossible matches
     """
     
-    def __init__(self):
+    def __init__(self, sheets_integration: Optional[GoogleSheetsIntegration] = None):
+        self.sheets_integration = sheets_integration
         self.distance_matrix = {}
         self.dogs_going_today = {}
         self.driver_capacities = {}
@@ -61,7 +192,14 @@ class DogReassignmentSystem:
         IMPORTANT: Distance = 0 means NOT a viable match 
         (dogs are too far apart or separated by barriers)
         """
-        matrix_df = self.load_csv_from_url(distance_url)
+        if self.sheets_integration:
+            try:
+                matrix_df = self.sheets_integration.read_sheet_as_dataframe(distance_url)
+            except:
+                # Fallback to CSV method
+                matrix_df = self.load_csv_from_url(distance_url)
+        else:
+            matrix_df = self.load_csv_from_url(distance_url)
         
         # First column contains dog IDs, remaining columns are distances
         dog_ids = [str(col).strip() for col in matrix_df.columns[1:]]
@@ -79,7 +217,14 @@ class DogReassignmentSystem:
 
     def load_combined_data(self, combined_csv_url: str):
         """Load combined CSV containing both dog assignments and driver capacity data."""
-        combined_df = self.load_csv_from_url(combined_csv_url)
+        if self.sheets_integration:
+            try:
+                combined_df = self.sheets_integration.read_sheet_as_dataframe(combined_csv_url)
+            except:
+                # Fallback to CSV method
+                combined_df = self.load_csv_from_url(combined_csv_url)
+        else:
+            combined_df = self.load_csv_from_url(combined_csv_url)
         
         # Extract dogs going today from the CSV
         for _, row in combined_df.iterrows():
@@ -385,6 +530,37 @@ class DogReassignmentSystem:
             self.reassign_single_dog(dog)
         
         return self.reassignments, self.unassigned
+    
+    def write_reassignments_to_sheet(self, sheet_url: str) -> Dict:
+        """Write reassignment results back to Google Sheet."""
+        if not self.sheets_integration:
+            raise ValueError("Google Sheets integration not available")
+        
+        if not self.reassignments:
+            return {"message": "No reassignments to write", "updates": []}
+        
+        # Prepare updates dictionary: dog_id -> new_assignment
+        updates = {}
+        for reassignment in self.reassignments:
+            dog_id = reassignment['Dog ID']
+            new_assignment = f"{reassignment['To Driver']}:{reassignment['Groups']}"
+            updates[dog_id] = new_assignment
+        
+        # Write to sheet
+        try:
+            updates_made = self.sheets_integration.update_column_by_dog_id(
+                sheet_url, 
+                updates, 
+                dog_id_column="Dog ID", 
+                target_column="Today"
+            )
+            
+            return {
+                "message": f"Successfully updated {len(updates_made)} assignments",
+                "updates": updates_made
+            }
+        except Exception as e:
+            raise Exception(f"Failed to write to Google Sheet: {str(e)}")
 
 # Helper function to convert Google Sheets URL to CSV
 def convert_to_csv_url(sheets_url):
@@ -411,23 +587,66 @@ def convert_to_csv_url(sheets_url):
 
 # STREAMLIT APP STARTS HERE
 st.title("🐕 Dog Reassignment System")
-st.markdown("Automatically reassign dogs when drivers call out")
+st.markdown("Automatically reassign dogs when drivers call out - now with Google Sheets integration!")
+
+# Initialize session state for service account
+if 'sheets_integration' not in st.session_state:
+    st.session_state.sheets_integration = None
 
 # Sidebar for inputs
 st.sidebar.header("🔗 Configuration")
+
+# Service Account Setup
+st.sidebar.subheader("🔐 Google Sheets Integration")
+
+service_account_option = st.sidebar.radio(
+    "Choose setup method:",
+    ["Use Streamlit Secrets", "Paste JSON directly", "No integration (read-only)"]
+)
+
+if service_account_option == "Use Streamlit Secrets":
+    try:
+        service_account_info = st.secrets["gcp_service_account"]
+        st.session_state.sheets_integration = GoogleSheetsIntegration(service_account_info)
+        st.sidebar.success("✅ Connected via Streamlit Secrets")
+    except Exception as e:
+        st.sidebar.error(f"❌ Secrets not found: {str(e)}")
+        st.sidebar.info("Add your service account JSON to Streamlit secrets as 'gcp_service_account'")
+
+elif service_account_option == "Paste JSON directly":
+    service_account_text = st.sidebar.text_area(
+        "Paste your service account JSON:",
+        placeholder='{"type": "service_account", "project_id": "...", ...}',
+        height=100
+    )
+    
+    if service_account_text:
+        try:
+            service_account_info = json.loads(service_account_text)
+            st.session_state.sheets_integration = GoogleSheetsIntegration(service_account_info)
+            st.sidebar.success("✅ Service account loaded successfully")
+        except json.JSONDecodeError:
+            st.sidebar.error("❌ Invalid JSON format")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error: {str(e)}")
+
+else:  # No integration
+    st.session_state.sheets_integration = None
+    st.sidebar.info("📖 Read-only mode - no write-back capability")
+
+# Data Sources
 st.sidebar.subheader("📊 Data Sources")
 
 # Combined CSV URL
 combined_sheets_url = st.sidebar.text_input(
     "Combined Sheet URL (Regular Google Sheets Link)", 
     value="",
-    help="Paste your regular Google Sheets URL here - we'll convert it to CSV format automatically"
+    help="Paste your regular Google Sheets URL here"
 )
 
 if combined_sheets_url:
     combined_csv_url = convert_to_csv_url(combined_sheets_url)
-    st.sidebar.success("✅ Converted to CSV format:")
-    st.sidebar.code(combined_csv_url, language=None)
+    st.sidebar.success("✅ Sheet URL configured")
 else:
     combined_csv_url = ""
 
@@ -439,31 +658,6 @@ distance_sheets_url = st.sidebar.text_input(
 )
 
 distance_url = convert_to_csv_url(distance_sheets_url)
-if distance_sheets_url:
-    st.sidebar.success("✅ Distance matrix CSV format:")
-    st.sidebar.code(distance_url, language=None)
-
-# Save URLs button
-if st.sidebar.button("💾 Save URLs"):
-    if combined_csv_url and distance_url:
-        # Create a config file content
-        config_content = f"""# Dog Reassignment System URLs
-# Generated on {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-COMBINED_CSV_URL={combined_csv_url}
-DISTANCE_MATRIX_URL={distance_url}
-
-# Use these URLs in your script or save this as config.env
-"""
-        st.sidebar.download_button(
-            label="📥 Download URL Config",
-            data=config_content,
-            file_name="dog_reassignment_urls.txt",
-            mime="text/plain"
-        )
-        st.sidebar.success("✅ URLs ready for download!")
-    else:
-        st.sidebar.error("Please enter both URLs first")
 
 # Run button
 if st.sidebar.button("🔄 Run Reassignment", type="primary"):
@@ -479,12 +673,45 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
     try:
         with st.spinner("Loading data and running reassignment..."):
             # Create system and run reassignment
-            system = DogReassignmentSystem()
+            system = DogReassignmentSystem(st.session_state.sheets_integration)
             reassignments, unassigned = system.run_reassignment(combined_csv_url, distance_url)
+        
+        # Store results in session state
+        st.session_state.system = system
+        st.session_state.reassignments = reassignments
+        st.session_state.unassigned = unassigned
+        st.session_state.combined_sheets_url = combined_sheets_url
         
         # Display results
         if reassignments or unassigned:
             st.success(f"✅ Reassignment complete!")
+            
+            # Write back option
+            if st.session_state.sheets_integration and reassignments:
+                st.info("🚀 **Google Sheets Integration Available!** You can now write results directly to your sheet.")
+                
+                col_write1, col_write2 = st.columns([1, 1])
+                
+                with col_write1:
+                    if st.button("📝 Write to Google Sheet", type="primary", help="Update your Google Sheet with new assignments"):
+                        try:
+                            with st.spinner("Writing to Google Sheet..."):
+                                result = system.write_reassignments_to_sheet(combined_sheets_url)
+                            
+                            st.success(f"✅ {result['message']}")
+                            
+                            # Show what was updated
+                            if result['updates']:
+                                st.subheader("📋 Updates Made")
+                                updates_df = pd.DataFrame(result['updates'])
+                                st.dataframe(updates_df, use_container_width=True)
+                                
+                        except Exception as e:
+                            st.error(f"❌ Failed to write to sheet: {str(e)}")
+                            st.info("💡 Make sure your service account has edit permissions on the sheet")
+                
+                with col_write2:
+                    st.info("📋 **Manual Copy-Paste Option** is still available below if you prefer")
             
             # Create two columns for results
             col1, col2 = st.columns(2)
@@ -519,18 +746,10 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
                         mime="text/csv"
                     )
                     
-                    # NEW: Copy-paste format for Google Sheets
-                    st.subheader("📋 Copy-Paste New Assignments")
-                    st.markdown("*Copy the text below and paste into your Google Sheet to update assignments*")
-                    
-                    # Option selector
-                    paste_option = st.radio(
-                        "What do you want to copy?",
-                        ["Just reassigned dogs", "All dogs (complete updated list)"],
-                        help="Choose whether to copy just the dogs that were reassigned, or all dogs with their updated assignments"
-                    )
-                    
-                    if paste_option == "Just reassigned dogs":
+                    # Manual copy-paste format (always available as backup)
+                    with st.expander("📋 Manual Copy-Paste (Backup Option)"):
+                        st.markdown("*Copy the text below and paste into your Google Sheet to update assignments manually*")
+                        
                         # Create the updated assignments for reassigned dogs only
                         paste_text_lines = ["Dog ID\tNew Assignment"]
                         for r in reassignments:
@@ -540,90 +759,13 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
                         paste_text = "\n".join(paste_text_lines)
                         
                         st.text_area(
-                            f"📋 Copy this text for {len(reassignments)} reassigned dogs (Ctrl+A, Ctrl+C):",
+                            f"📋 Copy this text for {len(reassignments)} reassigned dogs:",
                             value=paste_text,
                             height=200,
                             help="Select all text and copy, then paste into your Google Sheet"
                         )
                         
-                    else:  # All dogs
-                        # Get all current assignments and update with reassignments
-                        all_assignments = {}
-                        for dog_id, info in system.dogs_going_today.items():
-                            all_assignments[dog_id] = info['assignment']
-                        
-                        # Update with reassignments
-                        for r in reassignments:
-                            dog_id = r['Dog ID']
-                            new_assignment = f"{r['To Driver']}:{r['Groups']}"
-                            all_assignments[dog_id] = new_assignment
-                        
-                        # Format for pasting - all dogs
-                        paste_text_lines = ["Dog ID\tToday Assignment"]
-                        for dog_id, assignment in sorted(all_assignments.items()):
-                            paste_text_lines.append(f"{dog_id}\t{assignment}")
-                        
-                        paste_text = "\n".join(paste_text_lines)
-                        
-                        st.text_area(
-                            f"📋 Copy this text for ALL {len(all_assignments)} dogs (Ctrl+A, Ctrl+C):",
-                            value=paste_text,
-                            height=300,
-                            help="Complete updated list - select all text and copy, then paste into your Google Sheet"
-                        )
-                    
-                    # Instructions
-                    st.info("💡 **How to paste in Google Sheets:**\n1. Copy the text above (Ctrl+A, then Ctrl+C)\n2. In Google Sheets, click on cell A1 (or wherever you want to start)\n3. Paste (Ctrl+V)\n4. The data will automatically split into columns")
-                    
-                    # Alternative: Simple assignment list
-                    st.subheader("📝 Simple Assignment List (No Headers)")
-                    st.markdown("*If you just want the assignments in a simple list:*")
-                    
-                    if paste_option == "Just reassigned dogs":
-                        simple_assignments = []
-                        for r in reassignments:
-                            simple_assignments.append(f"{r['To Driver']}:{r['Groups']}")
-                        simple_text = "\n".join(simple_assignments)
-                        
-                        st.text_area(
-                            f"Simple list ({len(reassignments)} assignments):",
-                            value=simple_text,
-                            height=120,
-                            help="Just the new assignments, one per line"
-                        )
-                        
-                        # Show which dogs these correspond to
-                        with st.expander("🔍 See which dogs these assignments are for"):
-                            assignment_mapping = []
-                            for i, r in enumerate(reassignments):
-                                assignment_mapping.append({
-                                    'Line #': i + 1,
-                                    'Dog ID': r['Dog ID'],
-                                    'Dog Name': r['Dog Name'], 
-                                    'Assignment': f"{r['To Driver']}:{r['Groups']}"
-                                })
-                            st.dataframe(pd.DataFrame(assignment_mapping), use_container_width=True)
-                    
-                    else:  # All dogs simple list
-                        all_assignments = {}
-                        for dog_id, info in system.dogs_going_today.items():
-                            all_assignments[dog_id] = info['assignment']
-                        
-                        # Update with reassignments
-                        for r in reassignments:
-                            dog_id = r['Dog ID']
-                            new_assignment = f"{r['To Driver']}:{r['Groups']}"
-                            all_assignments[dog_id] = new_assignment
-                        
-                        simple_assignments = [assignment for assignment in sorted(all_assignments.values())]
-                        simple_text = "\n".join(simple_assignments)
-                        
-                        st.text_area(
-                            f"All assignments ({len(simple_assignments)} total):",
-                            value=simple_text,
-                            height=200,
-                            help="All assignments in order, one per line"
-                        )
+                        st.info("💡 **How to paste in Google Sheets:**\n1. Copy the text above (Ctrl+A, then Ctrl+C)\n2. In Google Sheets, click on cell A1 (or wherever you want to start)\n3. Paste (Ctrl+V)\n4. The data will automatically split into columns")
                 else:
                     st.info("No successful reassignments needed")
             
@@ -723,12 +865,21 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
 # Instructions section
 with st.expander("📖 How to Use"):
     st.markdown("""
-    ### Setup Instructions:
+    ### 🚀 New: Google Sheets Integration
+    **This app can now directly update your Google Sheets!**
+    
+    #### Setup Google Sheets Write Access:
+    1. **Service Account**: Use the provided service account JSON in Streamlit secrets
+    2. **Sheet Permissions**: Share your Google Sheet with: `my-service-account@clockin-375917.iam.gserviceaccount.com`
+    3. **Give Editor Access**: The service account needs "Editor" permissions
+    
+    ### Basic Usage:
     1. **Paste URLs**: Copy your Google Sheets URLs from your browser and paste them above
     2. **Sheet Format**: Ensure your data has the required columns:
        - **Dog data**: `Dog ID`, `Today`, `Number of dogs`, `Dog Name`, `Address`
        - **Driver data**: `Driver`, `Group 1`, `Group 2`, `Group 3` (use 'X' for callouts)
     3. **Click Run**: Press the "Run Reassignment" button to process
+    4. **Auto-Update**: Click "Write to Google Sheet" to automatically update assignments
     
     ### Distance Matrix Format (Google Sheets):
     Your distance matrix should have:
@@ -737,21 +888,21 @@ with st.expander("📖 How to Use"):
     - **Value = 0**: Dogs are NOT viable matches (too far apart or separated by barriers)
     - **Value > 0**: Actual distance in miles (viable match)
     
+    ### ✨ New Features:
+    - 🚀 **One-click Google Sheets updates** - no more manual copy/paste!
+    - 📊 **Live data integration** - reads directly from Google Sheets API
+    - ✅ **Update confirmation** - shows exactly what was changed
+    - 🔒 **Secure authentication** via service account
+    - 📋 **Backup copy-paste** option still available
+    
     ### Results Show:
     - ✅ **Which specific dog** they were matched with
     - ✅ **Distance** to that matched dog
     - ✅ **Driver assignment** and group information
-    - ✅ **Updated group counts** after reassignment (e.g., Bri:1 → 10 dogs)
+    - ✅ **Updated group counts** after reassignment
     - ✅ **Capacity status** with warnings for over-capacity groups
-    - ✅ **Copy-paste format** for updating your Google Sheet
+    - ✅ **Auto-update to Google Sheets** or copy-paste format
     - ✅ **Downloadable CSV** with all details
-    
-    ### Features:
-    - ✅ Prioritizes closest matches first
-    - ✅ Handles multi-group dogs (1&2, 2&3, etc.)
-    - ✅ Respects driver capacity limits  
-    - ✅ Shows matched dog details
-    - ✅ Live data from Google Sheets
     
     ### Callout Format:
     Mark driver callouts by putting **'X'** in the Group columns:
@@ -762,4 +913,4 @@ with st.expander("📖 How to Use"):
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ for efficient dog logistics • Live Google Sheets integration • Copy-paste ready results!")
+st.markdown("Built with ❤️ for efficient dog logistics • **Now with Google Sheets Integration!** • Live data sync • One-click updates")
