@@ -535,6 +535,68 @@ if st.sidebar.button("🔄 Run Reassignment", type="primary"):
                 success_rate = (len(reassignments) / total_dogs) * 100
                 
                 st.markdown("---")
+                
+                # Group capacity analysis
+                st.subheader("📊 Updated Group Counts After Reassignment")
+                st.markdown("*Shows current dog counts for all affected drivers and groups*")
+                
+                # Get all affected drivers (both giving and receiving)
+                affected_drivers = set()
+                if reassignments:
+                    for r in reassignments:
+                        affected_drivers.add(r['From Driver'])
+                        affected_drivers.add(r['To Driver'])
+                
+                # Create capacity overview
+                capacity_data = []
+                for driver in sorted(affected_drivers):
+                    for group in [1, 2, 3]:
+                        current_count = system.driver_loads.get(driver, {}).get(f'group{group}', 0)
+                        max_capacity = system.driver_capacities.get(driver, {}).get(f'group{group}', 9)
+                        
+                        # Determine status
+                        if current_count > max_capacity:
+                            status = "🔴 OVER"
+                        elif current_count == max_capacity:
+                            status = "🟡 FULL"
+                        elif current_count >= max_capacity * 0.8:
+                            status = "🟠 HIGH"
+                        else:
+                            status = "🟢 OK"
+                        
+                        capacity_data.append({
+                            'Driver:Group': f"{driver}:{group}",
+                            'Current Dogs': current_count,
+                            'Capacity': max_capacity,
+                            'Status': status,
+                            'Available Spots': max(0, max_capacity - current_count)
+                        })
+                
+                # Filter to show only groups with dogs or that had changes
+                capacity_df = pd.DataFrame(capacity_data)
+                # Show groups that either have dogs or were involved in reassignments
+                relevant_groups = capacity_df[
+                    (capacity_df['Current Dogs'] > 0) | 
+                    (capacity_df['Driver:Group'].str.contains('|'.join(affected_drivers)))
+                ]
+                
+                if not relevant_groups.empty:
+                    st.dataframe(relevant_groups, use_container_width=True)
+                    
+                    # Highlight any issues
+                    over_capacity = relevant_groups[relevant_groups['Status'] == '🔴 OVER']
+                    if not over_capacity.empty:
+                        st.error("⚠️ **CAPACITY WARNINGS:**")
+                        for _, row in over_capacity.iterrows():
+                            st.error(f"• {row['Driver:Group']}: {row['Current Dogs']} dogs (limit: {row['Capacity']})")
+                    
+                    full_groups = relevant_groups[relevant_groups['Status'] == '🟡 FULL']
+                    if not full_groups.empty:
+                        st.warning("📢 **FULL GROUPS:**")
+                        for _, row in full_groups.iterrows():
+                            st.warning(f"• {row['Driver:Group']}: {row['Current Dogs']}/{row['Capacity']} dogs")
+                
+                # Summary metrics
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
@@ -573,6 +635,8 @@ with st.expander("📖 How to Use"):
     - ✅ **Which specific dog** they were matched with
     - ✅ **Distance** to that matched dog
     - ✅ **Driver assignment** and group information
+    - ✅ **Updated group counts** after reassignment (e.g., Bri:1 → 10 dogs)
+    - ✅ **Capacity status** with warnings for over-capacity groups
     - ✅ **Downloadable CSV** with all details
     
     ### Features:
